@@ -1,0 +1,179 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import httpx
+import os
+import json
+import re
+import time
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+class AnalyzeRequest(BaseModel):
+    image_base64: str
+    task: str = "Analyze this screen and describe all visible UI elements"
+    url: str = ""
+
+class CompareRequest(BaseModel):
+    image1_base64: str
+    image2_base64: str
+    task: str = "Compare these two pages and list the differences"
+
+class VoiceRequest(BaseModel):
+    text: str
+    task: str = ""
+
+def parse_json(text: str) -> dict:
+    text = text.strip()
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text).strip()
+    try:
+        return json.loads(text)
+    except:
+        return {
+            "summary": text[:500],
+            "page_type": "unknown",
+            "ui_elements": {"buttons": 0, "inputs": 0, "text_elements": 0, "links": 0},
+            "detected_elements": [],
+            "recommended_actions": [],
+            "extracted_text": text,
+            "confidence": 0.5,
+            "analysis_notes": "Raw text response"
+        }
+
+@app.get("/")
+def root():
+    return {
+        "status": "Gemini Live Agent v4 — Online",
+        "gemini_configured": bool(GEMINI_API_KEY)
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": time.time()}
+
+@app.post("/analyze")
+async def analyze(req: AnalyzeRequest):
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured")
+    start = time.time()
+    prompt = f"""You are an expert UI/UX analyzer.
+Task: {req.task}
+{"URL: " + req.url if req.url else ""}
+Analyze the screenshot and return ONLY this JSON:
+{{
+  "summary": "Brief description",
+  "page_type": "login/dashboard/ecommerce/etc",
+  "ui_elements": {{"buttons": 0, "inputs": 0, "text_elements": 0, "links": 0}},
+  "detected_elements": [{{"type": "button/input/link/text", "label": "text", "position": "top/center/bottom"}}],
+  "recommended_actions": [{{"action": "click/type/scroll", "target": "element", "reason": "why"}}],
+  "extracted_text": "All visible text",
+  "confidence": 0.95,
+  "analysis_notes": "observations"
+}}
+Return ONLY valid JSON."""
+    parts = [
+        {"text": prompt},
+        {"inline_data": {"mime_type": "image/jpeg", "data": req.image_base64}}
+    ]
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.post(GEMINI_URL, json=payload)
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=res.text)
+        data = res.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = parse_json(text)
+        elapsed = round((time.time() - start) * 1000)
+        return {"success": True, "result": parsed, "elapsed_ms": elapsed}
+
+@app.post("/compare")
+async def compare(req: CompareRequest):
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured")
+    start = time.time()
+    prompt = f"""Compare these two screenshots.
+Task: {req.task}
+Return ONLY this JSON:
+{{
+  "summary": "Overall comparison",
+  "differences": [{{"category": "layout/content/style", "description": "what changed", "severity": "major/minor"}}],
+  "similarities": ["same things"],
+  "page1_description": "Page 1 description",
+  "page2_description": "Page 2 description",
+  "recommendation": "Which is better and why",
+  "score": {{"page1": 80, "page2": 85}}
+}}
+Return ONLY valid JSON."""
+    parts = [
+        {"text": prompt},
+        {"inline_data": {"mime_type": "image/jpeg", "data": req.image1_base64}},
+        {"inline_data": {"mime_type": "image/jpeg", "data": req.image2_base64}}
+    ]
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.post(GEMINI_URL, json=payload)
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=res.text)
+        data = res.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = parse_json(text)
+        elapsed = round((time.time() - start) * 1000)
+        return {"success": True, "result": parsed, "elapsed_ms": elapsed}
+
+@app.post("/voice-command")
+async def voice_command(req: VoiceRequest):
+    if not GEMINI_API_KEY:
+        return {"success": True, "result": {
+            "interpreted_task": req.text,
+            "action_type": "analyze",
+            "parameters": {},
+            "confirmation_message": "Processing: " + req.text,
+            "requires_screenshot": True
+        }}
+    prompt = f"""Interpret this voice command: "{req.text}"
+Return ONLY this JSON:
+{{
+  "interpreted_task": "What the user wants",
+  "action_type": "analyze/click/type/scroll/navigate/extract/compare",
+  "parameters": {{}},
+  "confirmation_message": "I will do X for you",
+  "requires_screenshot": true
+}}
+Return ONLY valid JSON."""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512}
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            res = await client.post(GEMINI_URL, json=payload)
+            data = res.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = parse_json(text)
+            return {"success": True, "result": parsed}
+    except:
+        return {"success": True, "result": {
+            "interpreted_task": req.text,
+            "action_type": "analyze",
+            "parameters": {},
+            "confirmation_message": "Processing: " + req.text,
+            "requires_screenshot": True
+        }}
